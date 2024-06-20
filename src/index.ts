@@ -1,68 +1,53 @@
-import { ChatOpenAI } from '@langchain/openai';
-import { Calculator } from '@langchain/community/tools/calculator';
-import { SerpAPI } from '@langchain/community/tools/serpapi';
-import { createOpenAIFunctionsAgent, AgentExecutor } from 'langchain/agents';
-import type { ChatPromptTemplate } from '@langchain/core/prompts';
+import { CheerioWebBaseLoader } from '@langchain/community/document_loaders/web/cheerio';
+import { RecursiveCharacterTextSplitter } from 'langchain/text_splitter';
+import { MemoryVectorStore } from 'langchain/vectorstores/memory';
+import { OpenAIEmbeddings, ChatOpenAI } from '@langchain/openai';
 import { pull } from 'langchain/hub';
-import { ChatMessageHistory } from 'langchain/stores/message/in_memory';
-import { RunnableWithMessageHistory } from '@langchain/core/runnables';
+import { ChatPromptTemplate } from '@langchain/core/prompts';
+import { StringOutputParser } from '@langchain/core/output_parsers';
+import { formatDocumentsAsString } from "langchain/util/document";
+import {
+  RunnableSequence,
+  RunnablePassthrough,
+} from "@langchain/core/runnables";
 require('dotenv').config();
 
-export const run = async () => {
-  const llm = new ChatOpenAI({ temperature: 0 });
-  const tools = [new SerpAPI(), new Calculator()];
-  const prompt = await pull<ChatPromptTemplate>(
-    'hwchase17/openai-functions-agent'
+const question = 'How many component are there in this post? And tell me summary of them.';
+
+(async () => {
+  const loader = new CheerioWebBaseLoader(
+    'https://lilianweng.github.io/posts/2023-06-23-agent/'
   );
-  const agent = await createOpenAIFunctionsAgent({
-    llm,
-    tools,
-    prompt,
-  });
-  const agentExecutor = new AgentExecutor({
-    agent,
-    tools,
-  });
-  const chatMessageHistory = new ChatMessageHistory();
-  const agentWithChatHistory = new RunnableWithMessageHistory({
-    runnable: agentExecutor,
-    getMessageHistory: (_sessionId) => chatMessageHistory,
-    inputMessagesKey: 'input',
-    historyMessagesKey: 'chat_history',
+
+  const docs = await loader.load();
+
+  const textSplitter = new RecursiveCharacterTextSplitter({
+    chunkSize: 1000,
+    chunkOverlap: 200,
   });
 
-  const setting = {
-    configurable: {
-      sessionId: 'foo',
+  const splits = await textSplitter.splitDocuments(docs);
+  const vectorStore = await MemoryVectorStore.fromDocuments(
+    splits,
+    new OpenAIEmbeddings()
+  );
+
+  const retriever = vectorStore.asRetriever();
+  const prompt = await pull<ChatPromptTemplate>('rlm/rag-prompt');
+  const llm = new ChatOpenAI({ model: 'gpt-4o', temperature: 0 });
+
+  const declarativeRagChain = RunnableSequence.from([
+    {
+      question: new RunnablePassthrough(),
+      context: retriever.pipe(formatDocumentsAsString),
     },
-  };
+    prompt,
+    llm,
+    new StringOutputParser(),
+  ]);
 
-  const input1 = 'こんにちは!';
-  const response1 = await agentWithChatHistory.invoke(
-    { input: input1 },
-    { ...setting }
-  );
-  console.log('Human:', input1);
-  console.log('AI:', response1['output']);
-  console.log('---');
+  const answer = await declarativeRagChain.invoke(question);
 
-  const input2 = 'AIさんの好きな料理は？';
-  const response2 = await agentWithChatHistory.invoke(
-    { input: input2 },
-    { ...setting }
-  );
-  console.log('Human:', input2);
-  console.log('AI:', response2['output']);
-  console.log('---');
-
-  const input3 = 'その料理の作り方は？';
-  const response3 = await agentWithChatHistory.invoke(
-    { input: input3 },
-    { ...setting }
-  );
-  console.log('Human:', input3);
-  console.log('AI:', response3['output']);
-  console.log('---');
-};
-
-run();
+  console.log('Question:', question);
+  console.log('Answer:', answer);
+})();
